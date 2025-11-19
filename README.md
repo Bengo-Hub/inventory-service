@@ -9,7 +9,7 @@ It exposes APIs and events for real-time availability, replenishment, and compli
 - Multi-warehouse inventory balances with lot/serial tracking.
 - Purchase orders, receipts, transfers, cycle counts, compliance events.
 - Reservation engine powering order fulfilment, omnichannel click-and-collect, and POS consumption.
-- Event-driven integrations with food-delivery backend, POS service, logistics service, notifications, and treasury using signed webhook callbacks instead of polling.
+- Event-driven integrations with cafe-backend, POS service, logistics service, notifications, and treasury using signed webhook callbacks instead of polling.
 
 ## Stack
 

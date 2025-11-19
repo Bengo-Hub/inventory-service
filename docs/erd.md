@@ -86,7 +86,7 @@ Schemas are defined via Ent and designed for strict multi-tenancy.
 | `webhook_subscriptions` | `id`, `tenant_id`, `event_key`, `target_url`, `secret`, `status`, `last_delivery_status`, `retry_count` | Configurable outbound hooks for partner integrations. |
 | `import_jobs` | `id`, `tenant_id`, `job_type`, `status`, `file_url`, `requested_by`, `started_at`, `completed_at`, `error_message` | Bulk upload pipeline for catalog/stock data. |
 | `export_jobs` | `id`, `tenant_id`, `job_type`, `parameters`, `status`, `requested_by`, `result_url`, `completed_at` | Scheduled exports to analytics or finance. |
-| `tenant_sync_events` | `id`, `tenant_id`, `tenant_slug`, `source_service`, `payload`, `synced_at`, `status` | Records inbound tenant/outlet discovery callbacks from auth/food-delivery/POS ensuring metadata is hydrated before inventory data is stored. |
+| `tenant_sync_events` | `id`, `tenant_id`, `tenant_slug`, `source_service`, `payload`, `synced_at`, `status` | Records inbound tenant/outlet discovery callbacks from auth/cafe-backend/POS ensuring metadata is hydrated before inventory data is stored. |
 
 ## Analytics & Forecasting (Roadmap)
 
@@ -97,16 +97,18 @@ Schemas are defined via Ent and designed for strict multi-tenancy.
 
 ## Relationships & Interfaces
 
+- **Entity Ownership**: This service owns all catalog and inventory entities. POS and Cafe services sync catalog items as read-only cache (`catalog_items` in POS, menu items in Cafe) but never duplicate item master data. All stock queries go through inventory-service APIs.
 - `items` link to `inventory_balances`, `inventory_ledger_entries`, `item_boms`, and `item_suppliers`.
 - `inventory_ledger_entries.reference_type` points to upstream documents (purchase orders, sales orders, transfer orders) using polymorphic references.
 - `goods_receipts` and `transfer_orders` feed reservations and the ledger via transactions.
-- `inventory_reservations` are consumed by food-delivery backend, POS, and logistics services to validate fulfilment eligibility using the same tenant/outlet identifiers.
+- `inventory_reservations` are consumed by cafe-backend, POS, and logistics services to validate fulfilment eligibility using the same tenant/outlet identifiers.
 - `outbox_events` emit domain events to:
-  - Food delivery backend (`inventory.reservation.created`, `inventory.low_stock`).
+  - Cafe backend (`inventory.reservation.created`, `inventory.low_stock`).
   - POS service (catalog sync, stock movements).
   - Logistics service (transfer released, pick wave ready).
   - Notifications service (expiry alerts).
 - Integration endpoints coordinate authentication secrets and sync windows with external providers; tenant/outlet discovery callbacks are processed before accepting domain payloads to guarantee referential integrity.
+- See `docs/cross-service-entity-ownership.md` for complete entity ownership matrix and integration patterns.
 
 ## Seed & Reference Data
 
