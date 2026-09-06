@@ -375,6 +375,11 @@ func (h *PricingTierHandler) UpsertItemPricing(w http.ResponseWriter, r *http.Re
 
 	// Load the item's selling-price guardrails once and reject any out-of-band tier price.
 	// Hard floor/ceiling — keeps catalog/POS prices coherent with the item's configured band.
+	// Only applies to the ALL-OUTLETS (default) row: an outlet-scoped override (outlet_id set)
+	// is a deliberate per-branch price decision that the whole per-outlet-pricing add-on exists
+	// to allow — a branch legitimately charging more (or less) than the tenant-wide default is
+	// the feature working as intended, not a mistake to block. Found live 2026-09-07: a branch
+	// price of 782 was rejected against a tenant-wide max of 780.
 	itm, err := h.orm.Item.Query().
 		Where(entitem.TenantID(tenantID), entitem.ID(itemID)).
 		Select(entitem.FieldMinSellingPrice, entitem.FieldMaxSellingPrice).
@@ -384,6 +389,9 @@ func (h *PricingTierHandler) UpsertItemPricing(w http.ResponseWriter, r *http.Re
 		return
 	}
 	for _, entry := range entries {
+		if entry.OutletID != nil {
+			continue
+		}
 		if itm.MinSellingPrice != nil && entry.Price < *itm.MinSellingPrice {
 			writeError(w, http.StatusUnprocessableEntity, "PRICE_BELOW_MIN",
 				fmt.Sprintf("price %.2f is below the item minimum %.2f", entry.Price, *itm.MinSellingPrice))
