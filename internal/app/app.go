@@ -410,6 +410,7 @@ func New(ctx context.Context) (*App, error) {
 
 	if natsConn != nil {
 		subCacheSub := subscriptions.NewCacheSubscriber(redisClient, log)
+		subCacheSub.SetNotifHub(notifHub)
 		if err := subCacheSub.Start(natsConn); err != nil {
 			log.Warn("app: failed to start subscription cache subscriber", zap.Error(err))
 		}

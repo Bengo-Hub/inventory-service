@@ -84,6 +84,8 @@ func (h *PricingTierHandler) RegisterRoutes(r chi.Router) {
 		ip.Get("/", h.GetItemPricing)
 		// Idempotency-Key guarded: a retried request must not double-apply a price change.
 		ip.With(perm(rbac.PermItemsChange), invmiddleware.Idempotency(h.orm)).Put("/", h.UpsertItemPricing)
+		// Delete ONE outlet-scoped price row (never the all-outlets default — see DeleteItemPricing).
+		ip.With(perm(rbac.PermItemsChange)).Delete("/{id}", h.DeleteItemPricing)
 	})
 
 	// Quantity-aware price resolution: returns unit price + total for N units using default tier.
@@ -347,9 +349,15 @@ func (h *PricingTierHandler) GetItemPricing(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	tierIDs := make([]uuid.UUID, 0, len(pricings))
+	for _, p := range pricings {
+		tierIDs = append(tierIDs, p.PricingTierID)
+	}
+	tiersByID := pricingTierNamesByID(r.Context(), h.orm, tenantID, tierIDs)
+
 	dtos := make([]itemPricingDTO, 0, len(pricings))
 	for _, p := range pricings {
-		dtos = append(dtos, toItemPricingDTO(p))
+		dtos = append(dtos, toItemPricingDTO(p, tiersByID))
 	}
 	writeJSON(w, http.StatusOK, dtos)
 }
@@ -423,6 +431,12 @@ func (h *PricingTierHandler) UpsertItemPricing(w http.ResponseWriter, r *http.Re
 	}
 	var pendingAudits []auditPending
 
+	entryTierIDs := make([]uuid.UUID, 0, len(entries))
+	for _, entry := range entries {
+		entryTierIDs = append(entryTierIDs, entry.PricingTierID)
+	}
+	tiersByID := pricingTierNamesByID(ctx, h.orm, tenantID, entryTierIDs)
+
 	results := make([]itemPricingDTO, 0, len(entries))
 	for _, entry := range entries {
 		q := tx.ItemPricing.Query().
@@ -456,7 +470,7 @@ func (h *PricingTierHandler) UpsertItemPricing(w http.ResponseWriter, r *http.Re
 		if qErr == nil && existing.Price == entry.Price && entry.TierBasis == string(existing.TierBasis) {
 			// No real change — skip the churn of closing + reopening an identical row.
 			saved := existing
-			results = append(results, toItemPricingDTO(saved))
+			results = append(results, toItemPricingDTO(saved, tiersByID))
 			continue
 		}
 		if qErr == nil {
@@ -495,7 +509,7 @@ func (h *PricingTierHandler) UpsertItemPricing(w http.ResponseWriter, r *http.Re
 			writeError(w, http.StatusInternalServerError, "UPSERT_FAILED", "Failed to upsert item pricing")
 			return
 		}
-		results = append(results, toItemPricingDTO(saved))
+		results = append(results, toItemPricingDTO(saved, tiersByID))
 
 		if prevPrice == nil || *prevPrice != saved.Price {
 			pendingAudits = append(pendingAudits, auditPending{
@@ -532,6 +546,104 @@ func (h *PricingTierHandler) UpsertItemPricing(w http.ResponseWriter, r *http.Re
 	}
 
 	writeJSON(w, http.StatusOK, results)
+}
+
+// DeleteItemPricing removes ONE outlet-scoped ItemPricing row, reverting that outlet back to
+// the tenant-wide (all-outlets) price for this tier. The all-outlets default row itself
+// (outlet_id nil) can't be deleted here — it IS the base every outlet falls back to once its own
+// override is gone, so there's nothing to "revert" it to; edit it via UpsertItemPricing instead.
+//
+// Cascades to pos-api's POSCatalogOverride.selling_price and ordering-backend's
+// CatalogOverride.base_price for the SAME (tenant, sku, outlet), via a published
+// "item.outlet_pricing_removed" event — a tenant deleting a per-branch price expects that branch
+// to actually charge the standard price again, but pos-api/ordering-backend each maintain their
+// OWN independent price override at their layer (inventory -> ordering -> pos, POS wins per the
+// three-layer precedence), so without this cascade a stale downstream override would keep
+// shadowing the now-reverted inventory price. Event-driven, not a direct S2S call, matching how
+// every other inventory->downstream catalog sync in this codebase works (inventory-api has no
+// direct dependency on pos-api/ordering-backend, deliberately, per the per-outlet-pricing plan).
+// DELETE /inventory/items/{itemID}/pricing/{id}
+func (h *PricingTierHandler) DeleteItemPricing(w http.ResponseWriter, r *http.Request) {
+	tenantID, err := parseTenantID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_TENANT", "Invalid tenant ID")
+		return
+	}
+	itemID, err := uuid.Parse(chi.URLParam(r, "itemID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_ITEM", "Invalid item ID")
+		return
+	}
+	pricingID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_PRICING", "Invalid pricing id")
+		return
+	}
+
+	ctx := r.Context()
+	existing, err := h.orm.ItemPricing.Query().
+		Where(entip.ID(pricingID), entip.TenantID(tenantID), entip.ItemID(itemID)).
+		Only(ctx)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "PRICING_NOT_FOUND", "Pricing entry not found")
+		return
+	}
+	if existing.OutletID == nil {
+		writeError(w, http.StatusUnprocessableEntity, "CANNOT_DELETE_DEFAULT",
+			"The all-outlets default price can't be deleted this way — edit it instead")
+		return
+	}
+
+	itm, err := h.orm.Item.Query().
+		Where(entitem.TenantID(tenantID), entitem.ID(itemID)).
+		Select(entitem.FieldSku).
+		First(ctx)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "ITEM_NOT_FOUND", "Item not found")
+		return
+	}
+
+	tx, err := h.orm.Tx(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "TX_FAILED", "Failed to start transaction")
+		return
+	}
+	if err := tx.ItemPricing.DeleteOne(existing).Exec(ctx); err != nil {
+		_ = tx.Rollback()
+		h.log.Error("delete item pricing failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "DELETE_FAILED", "Failed to delete item pricing")
+		return
+	}
+	// Publish inside the same transaction as the delete — same reasoning as
+	// publishPricingUpdatedEventTx: a crash between "row deleted" and "event published" must not
+	// silently strand a stale downstream override.
+	platformevents.WriteOutboxTx(ctx, tx, h.log, tenantID, itemID, "inventory", "item.outlet_pricing_removed", map[string]any{
+		"item_id":         itemID,
+		"sku":             itm.Sku,
+		"pricing_tier_id": existing.PricingTierID,
+		"outlet_id":       *existing.OutletID,
+	})
+	if err := tx.Commit(); err != nil {
+		h.log.Error("delete item pricing: commit failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "COMMIT_FAILED", "Failed to delete item pricing")
+		return
+	}
+
+	if h.auditSvc != nil {
+		actor := actorFromRequest(r)
+		h.auditSvc.Record(ctx, audit.Entry{
+			TenantID:    tenantID,
+			OutletID:    existing.OutletID,
+			ActorUserID: actor,
+			Action:      "item.outlet_pricing_deleted",
+			EntityType:  "item_pricing",
+			EntityID:    itemID.String(),
+			Before:      map[string]any{"pricing_tier_id": existing.PricingTierID, "price": existing.Price, "outlet_id": existing.OutletID},
+			After:       map[string]any{"reverted_to": "all_outlets_default"},
+		})
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 type generateTierPricingReq struct {
@@ -1034,7 +1146,15 @@ func toPricingTierDTO(t *ent.PricingTier) pricingTierDTO {
 	}
 }
 
-func toItemPricingDTO(p *ent.ItemPricing) itemPricingDTO {
+// toItemPricingDTO converts one ItemPricing row. tiersByID is an optional lookup (built once
+// per request by the caller, see pricingTierNamesByID) resolving PricingTierID to its real
+// Name/Code — ItemPricing has no ent edge to PricingTier (a plain UUID field), so without this
+// the frontend has nothing to render but the raw tier UUID (a real, long-standing UX bug: the
+// Catalog item detail page's "Price profiles" table showed e.g.
+// "3e0f6434-2f1f-4c94-a99f-ce5c2bc09814 (BOI ENTERPRISES)" instead of "Retail (BOI ENTERPRISES)",
+// reported live 2026-09-07). tiersByID may be nil; a missing entry just leaves TierName/TierCode
+// empty, same as before this fix.
+func toItemPricingDTO(p *ent.ItemPricing, tiersByID map[uuid.UUID]*ent.PricingTier) itemPricingDTO {
 	dto := itemPricingDTO{
 		ID:            p.ID,
 		ItemID:        p.ItemID,
@@ -1046,8 +1166,29 @@ func toItemPricingDTO(p *ent.ItemPricing) itemPricingDTO {
 		EffectiveFrom: p.EffectiveFrom,
 		IsActive:      p.IsActive,
 	}
+	if t := tiersByID[p.PricingTierID]; t != nil {
+		dto.TierName = t.Name
+		dto.TierCode = t.Code
+	}
 	if p.EffectiveTo != nil {
 		dto.EffectiveTo = p.EffectiveTo
 	}
 	return dto
+}
+
+// pricingTierNamesByID batch-resolves every distinct tier id referenced by ids into its
+// PricingTier row, in one query — avoids an N+1 lookup per pricing row.
+func pricingTierNamesByID(ctx context.Context, orm *ent.Client, tenantID uuid.UUID, ids []uuid.UUID) map[uuid.UUID]*ent.PricingTier {
+	out := map[uuid.UUID]*ent.PricingTier{}
+	if len(ids) == 0 {
+		return out
+	}
+	tiers, err := orm.PricingTier.Query().Where(entpt.TenantID(tenantID), entpt.IDIn(ids...)).All(ctx)
+	if err != nil {
+		return out
+	}
+	for _, t := range tiers {
+		out[t.ID] = t
+	}
+	return out
 }

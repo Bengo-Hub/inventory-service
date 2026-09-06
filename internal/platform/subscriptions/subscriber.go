@@ -2,21 +2,31 @@ package subscriptions
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 
 	eventslib "github.com/Bengo-Hub/shared-events"
+	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
+
+	notifmod "github.com/bengobox/inventory-service/internal/modules/notifications"
 )
 
-// CacheSubscriber listens for tenant.subscription.updated events and invalidates
-// the shared tenant branding/metadata cache so downstream reads pick up new plan data.
+// CacheSubscriber listens for tenant.subscription.updated events (plan changes, suspensions,
+// and — since 2026-09-07 — TenantFeatureGrant add-on grants/revokes) and (1) invalidates the
+// shared tenant branding/metadata cache so downstream reads pick up new plan data, and (2) pushes
+// a real-time "entitlements_changed" nudge over the same notification hub inventory-ui already
+// holds open for stock/catalog pushes, so an already-open browser tab reflects a revoke/grant/
+// plan-change within seconds instead of only on its next full page load. Without this, a tenant
+// admin revoking an add-on (e.g. multi_branch_pricing) sees the change reflected on THEIR OWN
+// screen, but any other already-open tenant session keeps showing the stale entitlement until
+// that tab is reloaded — see the per-outlet-pricing plan's Phase 6 notes for the live report.
 type CacheSubscriber struct {
-	redis  *redis.Client
-	logger *zap.Logger
-	sub    *nats.Subscription
+	redis    *redis.Client
+	logger   *zap.Logger
+	sub      *nats.Subscription
+	notifHub *notifmod.Hub
 }
 
 // NewCacheSubscriber creates a CacheSubscriber.
@@ -26,6 +36,10 @@ func NewCacheSubscriber(redisClient *redis.Client, logger *zap.Logger) *CacheSub
 		logger: logger.Named("subscriptions.cache-subscriber"),
 	}
 }
+
+// SetNotifHub wires the real-time push hub (optional — nil degrades to cache-invalidation-only,
+// the pre-existing behavior). Call before Start.
+func (s *CacheSubscriber) SetNotifHub(hub *notifmod.Hub) { s.notifHub = hub }
 
 // Start subscribes to tenant.subscription.updated on the provided NATS connection.
 func (s *CacheSubscriber) Start(conn *nats.Conn) error {
@@ -46,18 +60,15 @@ func (s *CacheSubscriber) Stop() {
 }
 
 func (s *CacheSubscriber) handle(msg *nats.Msg) {
-	var wrapper struct {
-		TenantSlug string                 `json:"tenant_slug,omitempty"`
-		Payload    map[string]interface{} `json:"payload"`
-	}
-	if err := json.Unmarshal(msg.Data, &wrapper); err != nil {
+	evt, err := eventslib.FromJSON(msg.Data)
+	if err != nil {
 		s.logger.Warn("failed to parse subscription.updated event", zap.Error(err))
 		return
 	}
 
-	slug := wrapper.TenantSlug
+	slug := evt.TenantSlug
 	if slug == "" {
-		if v, ok := wrapper.Payload["tenant_slug"].(string); ok {
+		if v, ok := evt.Payload["tenant_slug"].(string); ok {
 			slug = v
 		}
 	}
@@ -75,7 +86,17 @@ func (s *CacheSubscriber) handle(msg *nats.Msg) {
 			zap.String("key", cacheKey),
 			zap.Error(err),
 		)
-		return
+	} else {
+		s.logger.Debug("invalidated tenant cache on subscription update", zap.String("key", cacheKey))
 	}
-	s.logger.Debug("invalidated tenant cache on subscription update", zap.String("key", cacheKey))
+
+	// Real-time push: nudge every open browser tab for this tenant to refetch its entitlements.
+	// Best-effort — a missing/nil TenantID (a malformed or legacy event) just skips the push,
+	// same fail-open posture as the rest of this best-effort cache-invalidation subscriber.
+	if s.notifHub != nil && evt.TenantID != uuid.Nil {
+		s.notifHub.BroadcastToTenant(evt.TenantID, notifmod.Message{
+			Type:    "entitlements_changed",
+			Payload: map[string]any{"tenant_id": evt.TenantID},
+		})
+	}
 }
