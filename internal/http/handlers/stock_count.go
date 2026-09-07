@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"net/http"
@@ -558,11 +559,64 @@ func (h *StockCountHandler) List(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "QUERY_FAILED", "Failed to list counts")
 		return
 	}
+	countIDs := make([]uuid.UUID, 0, len(rows))
+	for _, c := range rows {
+		countIDs = append(countIDs, c.ID)
+	}
+	summaries := h.varianceSummaryByCount(r.Context(), countIDs)
+
 	out := make([]map[string]any, 0, len(rows))
 	for _, c := range rows {
-		out = append(out, countDTO(c))
+		dto := countDTO(c)
+		if vc, ok := summaries[c.ID]; ok {
+			dto["pending_lines"] = vc.pending
+			dto["positive_lines"] = vc.positive
+			dto["negative_lines"] = vc.negative
+			dto["matched_lines"] = vc.matched
+			dto["total_lines"] = vc.pending + vc.positive + vc.negative + vc.matched
+		}
+		out = append(out, dto)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": out})
+}
+
+// varianceCounts is a per-stock-count line-status breakdown — pending (not yet counted), positive
+// (surplus), negative (shortage), matched (counted, exact match). Powers the Stock Take list
+// page's Variance column and the detail page's pending/positive/negative filter pills.
+type varianceCounts struct{ pending, positive, negative, matched int }
+
+// varianceSummaryByCount computes varianceCounts for every id in countIDs in ONE query (only the
+// 3 columns needed, never the full line rows) — avoids an N+1 per row on the list page. Best-effort:
+// a query failure returns an empty map, so the list still renders (just without the summary),
+// matching this handler's existing fail-soft style elsewhere (e.g. item enrichment in Get).
+func (h *StockCountHandler) varianceSummaryByCount(ctx context.Context, countIDs []uuid.UUID) map[uuid.UUID]varianceCounts {
+	out := map[uuid.UUID]varianceCounts{}
+	if len(countIDs) == 0 {
+		return out
+	}
+	lines, err := h.orm.StockCountLine.Query().
+		Where(entcountline.StockCountIDIn(countIDs...)).
+		Select(entcountline.FieldStockCountID, entcountline.FieldCountedQty, entcountline.FieldVariance).
+		All(ctx)
+	if err != nil {
+		h.log.Warn("variance summary query failed — list will render without it", zap.Error(err))
+		return out
+	}
+	for _, ln := range lines {
+		vc := out[ln.StockCountID]
+		switch {
+		case ln.CountedQty == nil:
+			vc.pending++
+		case ln.Variance != nil && *ln.Variance > 0:
+			vc.positive++
+		case ln.Variance != nil && *ln.Variance < 0:
+			vc.negative++
+		default:
+			vc.matched++
+		}
+		out[ln.StockCountID] = vc
+	}
+	return out
 }
 
 // Get handles GET /inventory/stock-counts/{id} with its lines.
