@@ -2425,12 +2425,15 @@ func resolveReorderLevel(ctx context.Context, client *ent.Client, tenantID uuid.
 	return 1
 }
 
-// isStockTracked reports whether an item type holds physical stock that should
+// IsStockTracked reports whether an item type holds physical stock that should
 // appear in inventory balances. SERVICE and VOUCHER are non-stockable (e.g.
 // "Conference charges"); RECIPE availability is derived from its BOM, so it is
 // not tracked as a balance directly either. Only GOODS, INGREDIENT and EQUIPMENT
-// carry real on-hand stock.
-func isStockTracked(t item.Type) bool {
+// carry real on-hand stock. Exported so every other balance-creating entry point
+// (bulk import, manual adjustments, …) can share this single source of truth
+// instead of re-deriving it — a bookable SERVICE item getting a real stock
+// balance is a live-observed bug class (see urban-loft's Co-working-Space items).
+func IsStockTracked(t item.Type) bool {
 	switch t {
 	case item.TypeGOODS, item.TypeINGREDIENT, item.TypeEQUIPMENT:
 		return true
@@ -2738,7 +2741,7 @@ func (s *Service) createItemOnce(ctx context.Context, tenantID uuid.UUID, dto It
 			warehouse.IsActive(true),
 		).
 		First(ctx)
-	if whErr == nil && isStockTracked(i.Type) {
+	if whErr == nil && IsStockTracked(i.Type) {
 		// Resolve unit of measure name for the balance
 		uom := "PIECE"
 		if dto.UnitID != nil {
@@ -3185,7 +3188,7 @@ func (s *Service) UpdateItem(ctx context.Context, tenantID uuid.UUID, id uuid.UU
 	// Reorder policy LIVES on the balance (per warehouse) — the item DTO only mirrors it —
 	// so an edit on a never-stocked item must CREATE the default-warehouse balance row or
 	// the form's reorder values would silently vanish on save.
-	if dto.ReorderLevel > 0 || dto.ReorderQuantity > 0 {
+	if (dto.ReorderLevel > 0 || dto.ReorderQuantity > 0) && IsStockTracked(i.Type) {
 		bals, balErr := tx.InventoryBalance.Query().
 			Where(inventorybalance.ItemID(i.ID), inventorybalance.TenantID(tenantID)).
 			All(ctx)

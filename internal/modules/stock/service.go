@@ -278,6 +278,13 @@ func (s *Service) AdjustStock(ctx context.Context, tenantID uuid.UUID, req Adjus
 	if err != nil {
 		return nil, fmt.Errorf("stock: item not found: sku=%s: %w", req.SKU, err)
 	}
+	// SERVICE items (bookable rooms/facilities/conference slots, fees) represent capacity or a
+	// charge, not physical stock — they must never be adjustable here. Seeing one get a real
+	// balance row that then depletes like normal stock is a live-observed bug (a co-working-space
+	// SERVICE item at urban-loft had actually decremented 100->89 as if every booking sold a unit).
+	if itm.Type == item.TypeSERVICE {
+		return nil, fmt.Errorf("stock: %q is a SERVICE item (capacity/booking, not stock) and cannot be stock-adjusted", req.SKU)
+	}
 
 	bal, err := tx.InventoryBalance.Query().
 		Where(

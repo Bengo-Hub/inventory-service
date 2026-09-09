@@ -12,6 +12,7 @@ import (
 	entinventorylot "github.com/bengobox/inventory-service/internal/ent/inventorylot"
 	entitem "github.com/bengobox/inventory-service/internal/ent/item"
 	entwarehouse "github.com/bengobox/inventory-service/internal/ent/warehouse"
+	"github.com/bengobox/inventory-service/internal/modules/items"
 	"github.com/bengobox/inventory-service/internal/modules/modifiers"
 	"github.com/bengobox/inventory-service/internal/modules/recipes"
 	"github.com/bengobox/inventory-service/internal/modules/stock"
@@ -492,6 +493,17 @@ func (h *InventoryHandler) parseXLSXInitialStock(
 		if itemErr != nil {
 			res.Failed++
 			res.Errors = append(res.Errors, fmt.Sprintf("sku=%s: item not found for stock adjustment", itemSKU))
+			continue
+		}
+		// SERVICE/RECIPE/VOUCHER items represent capacity, a made-to-order dish, or a
+		// digital credit — never physical stock — so a row in this sheet for one is almost
+		// certainly a spreadsheet mistake (a fill-down past the intended range), not a real
+		// stock count. Same rule CreateItem's own initial-balance step already enforces
+		// (items.IsStockTracked) — reused here rather than silently creating a balance that
+		// then depletes like real stock on every "sale" (a live-observed bug at urban-loft).
+		if !items.IsStockTracked(itm.Type) {
+			res.Failed++
+			res.Errors = append(res.Errors, fmt.Sprintf("sku=%s: %s items don't carry physical stock, skipped", itemSKU, itm.Type))
 			continue
 		}
 
