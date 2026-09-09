@@ -57,7 +57,7 @@ type ItemsServicer interface {
 	ListItemVariants(ctx context.Context, tenantID, itemID uuid.UUID) ([]items.VariantDTO, error)
 	ListEventItems(ctx context.Context, tenantID uuid.UUID, limit, offset int) ([]items.ItemDTO, int, error)
 	ListCategories(ctx context.Context, tenantID uuid.UUID) ([]items.CategoryDTO, error)
-	ListCategoriesFiltered(ctx context.Context, tenantID uuid.UUID, hasItems bool) ([]items.CategoryDTO, error)
+	ListCategoriesFiltered(ctx context.Context, tenantID uuid.UUID, hasItems, sellableOnly bool) ([]items.CategoryDTO, error)
 	CreateCategory(ctx context.Context, tenantID uuid.UUID, dto items.CategoryDTO) (*items.CategoryDTO, error)
 	UpdateCategory(ctx context.Context, tenantID, id uuid.UUID, dto items.CategoryDTO) (*items.CategoryDTO, error)
 	DeleteCategory(ctx context.Context, tenantID, id uuid.UUID) error
@@ -2305,8 +2305,14 @@ func (h *InventoryHandler) ListCategories(w http.ResponseWriter, r *http.Request
 	// has_items=true → only categories with at least one active item linked
 	// (used by selection surfaces so a picked category never yields an empty set).
 	hasItems := strings.EqualFold(r.URL.Query().Get("has_items"), "true") || r.URL.Query().Get("has_items") == "1"
+	// sellable_only=true → same, but additionally requires that item to be not_for_sale=false.
+	// A category whose only items are ALL flagged not_for_sale (raw ingredients, internal
+	// supplies) has "items" in the has_items sense but is functionally empty on any sales
+	// surface — POS/ordering ask for this stricter mode; label printing keeps plain has_items
+	// so staff can still pick a component category to print internal-stock barcode labels.
+	sellableOnly := strings.EqualFold(r.URL.Query().Get("sellable_only"), "true") || r.URL.Query().Get("sellable_only") == "1"
 
-	results, err := h.itemsSvc.ListCategoriesFiltered(r.Context(), tenantID, hasItems)
+	results, err := h.itemsSvc.ListCategoriesFiltered(r.Context(), tenantID, hasItems, sellableOnly)
 	if err != nil {
 		h.log.Error("list categories failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "INTERNAL", "Failed to list categories")

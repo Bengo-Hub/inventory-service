@@ -1767,7 +1767,14 @@ func (s *Service) DeactivateItemBySKU(ctx context.Context, tenantID uuid.UUID, s
 	return nil
 }
 
-// DeleteCategory soft-deletes a category (sets is_active=false).
+// DeleteCategory removes a category. A category with NO items linked to it (in any
+// status — active, inactive or EOL) is hard-deleted outright: an empty category is
+// pure clutter (it can never legitimately appear on a sales surface, since every
+// sellable-category listing already requires has_items=true) and keeping a dead row
+// around only invites confusion (e.g. a stray "Installation & Setup" or "Consumables"
+// category some staff member created and never used). A category that still has at
+// least one item linked keeps the original reversible soft-delete (is_active=false) —
+// deleting it outright would orphan those items' category_id.
 func (s *Service) DeleteCategory(ctx context.Context, tenantID, id uuid.UUID) error {
 	existing, err := s.client.ItemCategory.Query().
 		Where(itemcategory.TenantID(tenantID), itemcategory.ID(id)).
@@ -1778,8 +1785,28 @@ func (s *Service) DeleteCategory(ctx context.Context, tenantID, id uuid.UUID) er
 		}
 		return fmt.Errorf("items: query category: %w", err)
 	}
-	if _, err := s.client.ItemCategory.UpdateOneID(existing.ID).SetIsActive(false).Save(ctx); err != nil {
-		return fmt.Errorf("items: delete category: %w", err)
+	hasItems, err := s.client.Item.Query().
+		Where(item.TenantID(tenantID), item.CategoryID(existing.ID)).
+		Exist(ctx)
+	if err != nil {
+		return fmt.Errorf("items: check category items: %w", err)
+	}
+	if hasItems {
+		if _, err := s.client.ItemCategory.UpdateOneID(existing.ID).SetIsActive(false).Save(ctx); err != nil {
+			return fmt.Errorf("items: delete category: %w", err)
+		}
+	} else {
+		// Hard delete: also detach any children pointing at this category as their
+		// parent so a purge never leaves a dangling parent_id.
+		if _, err := s.client.ItemCategory.Update().
+			Where(itemcategory.TenantID(tenantID), itemcategory.ParentID(existing.ID)).
+			ClearParentID().
+			Save(ctx); err != nil {
+			return fmt.Errorf("items: detach child categories: %w", err)
+		}
+		if err := s.client.ItemCategory.DeleteOneID(existing.ID).Exec(ctx); err != nil {
+			return fmt.Errorf("items: hard delete category: %w", err)
+		}
 	}
 	// Invalidate categories cache
 	if s.cache != nil {
@@ -2072,20 +2099,24 @@ func (s *Service) UpdateCategory(ctx context.Context, tenantID, id uuid.UUID, dt
 
 // ListCategories returns all item categories for a tenant (cached 5 min).
 func (s *Service) ListCategories(ctx context.Context, tenantID uuid.UUID) ([]CategoryDTO, error) {
-	return s.ListCategoriesFiltered(ctx, tenantID, false)
+	return s.ListCategoriesFiltered(ctx, tenantID, false, false)
 }
 
-// ListCategoriesFiltered returns item categories for a tenant. When hasItems is
-// true, only categories with at least one active item linked to them are
-// returned — selection surfaces (label printing, the POS/ordering catalog
-// proxies) use this so a chosen category can never resolve to an empty
-// selection / an empty storefront aisle.
-func (s *Service) ListCategoriesFiltered(ctx context.Context, tenantID uuid.UUID, hasItems bool) ([]CategoryDTO, error) {
+// ListCategoriesFiltered returns item categories for a tenant.
+//   - hasItems=true: only categories with at least one active item linked to them are
+//     returned — selection surfaces (e.g. label printing, which legitimately needs to
+//     print barcode labels for not-for-sale internal stock too) use this so a chosen
+//     category can never resolve to an empty selection.
+//   - sellableOnly=true: the stricter mode POS/ordering use — a category only counts as
+//     "has items" if at least one of them is also not_for_sale=false. A category whose
+//     items are ALL raw ingredients / internal supplies (not_for_sale=true) has items in
+//     the plain hasItems sense but is functionally an empty aisle on a sales surface.
+func (s *Service) ListCategoriesFiltered(ctx context.Context, tenantID uuid.UUID, hasItems, sellableOnly bool) ([]CategoryDTO, error) {
 	all, err := s.listCategoriesAll(ctx, tenantID)
-	if err != nil || !hasItems {
+	if err != nil || (!hasItems && !sellableOnly) {
 		return all, err
 	}
-	withItems, err := s.categoryIDsWithItems(ctx, tenantID)
+	withItems, err := s.categoryIDsWithItems(ctx, tenantID, sellableOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -2098,18 +2129,23 @@ func (s *Service) ListCategoriesFiltered(ctx context.Context, tenantID uuid.UUID
 	return filtered, nil
 }
 
-// categoryIDsWithItems returns the set of category IDs that have at least one
-// active item linked. Cheap GROUP BY on the (tenant_id, category_id) index.
-func (s *Service) categoryIDsWithItems(ctx context.Context, tenantID uuid.UUID) (map[uuid.UUID]struct{}, error) {
+// categoryIDsWithItems returns the set of category IDs that have at least one active
+// item linked (and, when sellableOnly is set, at least one of those items is also
+// not_for_sale=false). Cheap GROUP BY on the (tenant_id, category_id) index.
+func (s *Service) categoryIDsWithItems(ctx context.Context, tenantID uuid.UUID, sellableOnly bool) (map[uuid.UUID]struct{}, error) {
 	var rows []struct {
 		CategoryID uuid.UUID `json:"category_id"`
 	}
+	preds := []predicate.Item{
+		item.TenantID(tenantID),
+		item.IsActive(true),
+		item.CategoryIDNotNil(),
+	}
+	if sellableOnly {
+		preds = append(preds, item.NotForSale(false))
+	}
 	err := s.client.Item.Query().
-		Where(
-			item.TenantID(tenantID),
-			item.IsActive(true),
-			item.CategoryIDNotNil(),
-		).
+		Where(preds...).
 		GroupBy(item.FieldCategoryID).
 		Scan(ctx, &rows)
 	if err != nil {
@@ -2580,6 +2616,13 @@ func (s *Service) createItemOnce(ctx context.Context, tenantID uuid.UUID, dto It
 	}
 	if dto.NotForSale != nil {
 		createBuilder = createBuilder.SetNotForSale(*dto.NotForSale)
+	} else if dto.Type == string(item.TypeINGREDIENT) {
+		// Raw ingredients are recipe/BOM inputs, not standalone sellable products — a
+		// caller that doesn't explicitly say otherwise must never end up on a POS/ordering
+		// sales surface (see not_for_sale's own schema comment). Staff can still flip this
+		// per-item via inventory-ui's "Mark for sale" bulk action to explicitly sell a raw
+		// ingredient directly (e.g. loose ice, a bottled sauce).
+		createBuilder = createBuilder.SetNotForSale(true)
 	}
 	if dto.UsableInRecipes != nil {
 		createBuilder = createBuilder.SetUsableInRecipes(*dto.UsableInRecipes)
